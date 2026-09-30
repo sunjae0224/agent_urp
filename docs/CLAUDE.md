@@ -13,6 +13,7 @@
 | `docs/research-landscape.md` | 관련 연구 5개 분야 지도, 계획서 인용 검증, 최근접 선행 연구 2편 대조, 우리 기여·위협과 대응, 필독 논문, 프레임워크·벤치마크 판정. |
 | `docs/study-guide.md` | 에이전트 경험 없는 팀원용 선행 학습 — 주차별 학습, 세미나 순서, 도구·개념 체크리스트. |
 | `docs/roadmap.md` | 12/18까지 주차 계획, 팀 역할, GPU-free→GPU 확장 경로, 데모 체크포인트. |
+| `docs/overview.html` | 연구 개요 artifact 페이지 원본(한국어, 논문 용어). Claude Code에서 `docs/overview.html`을 Artifact로 publish하면 그 세션 계정 소유로 생성됨. |
 
 ## 갱신 규칙
 
