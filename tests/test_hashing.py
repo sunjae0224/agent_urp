@@ -1,4 +1,4 @@
-from enum import Enum
+from enum import StrEnum
 
 import pytest
 from pydantic import BaseModel
@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from agent_urp.core.hashing import canonical_json, content_hash
 
 
-class Color(str, Enum):  # noqa: UP042
+class Color(StrEnum):
     RED = "red"
 
 

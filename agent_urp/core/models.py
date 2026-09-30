@@ -1,7 +1,7 @@
 """Data model: content-addressed artifacts/blocks and append-only step records (spec §5)."""
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -9,41 +9,41 @@ from pydantic import BaseModel, Field
 from agent_urp.core.hashing import content_hash
 
 
-class StepKind(str, Enum):  # noqa: UP042
+class StepKind(StrEnum):
     LLM = "llm"
     TOOL = "tool"
     MEMORY = "memory"
     ASSEMBLE = "assemble"
 
 
-class Decision(str, Enum):  # noqa: UP042
+class Decision(StrEnum):
     REUSE = "reuse"
     REBUILD = "rebuild"
     RERUN = "rerun"
     LIVE = "live"  # executed with no matching record in the parent run
 
 
-class Policy(str, Enum):  # noqa: UP042
+class Policy(StrEnum):
     FULL = "full"
     SUFFIX = "suffix"
     MEMO = "memo"
     DEP = "dep"
 
 
-class Durability(str, Enum):  # noqa: UP042
+class Durability(StrEnum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
 
 
-class BlockKind(str, Enum):  # noqa: UP042
+class BlockKind(StrEnum):
     STATIC = "static"
     USER = "user"
     MEMORY = "memory"
     DERIVED = "derived"
 
 
-class SamplingIntent(str, Enum):  # noqa: UP042
+class SamplingIntent(StrEnum):
     STABLE = "stable"
     FRESH = "fresh"
 
