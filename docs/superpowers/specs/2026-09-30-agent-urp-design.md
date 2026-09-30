@@ -112,9 +112,9 @@
 | `DepGraph` | run의 의존성 그래프 (block/artifact → step → artifact) | `dirty_from(changed_ids)`, `topo_order` | NetworkX, TraceStore |
 | `ContextAssembler` | step이 선언한 block들로 prompt 조립, **layout 정책** 적용 (stable-prefix 순서) | `assemble(step, block_versions) -> Prompt` | TraceStore |
 | `Memo` | constructive trace: `(step_kind, input_hash) → output artifact` | `lookup`, `store` | TraceStore |
-| `Invalidator` | 편집 → dirty set, 실행 후 동등성 검사로 early cutoff | `mark_dirty`, `cutoff_if_equivalent` | DepGraph, Equivalence |
-| `Equivalence` | pluggable 동등성 oracle: exact / normalized / toolcall-canonical / embedding / llm-judge | `equivalent(a, b, kind) -> (bool, evidence)` | 선택적으로 LLM backend |
-| `Scheduler` | 원 trace 순서로 REUSE/REBUILD/RERUN 결정, 구조 분기 시 live 실행으로 전환 | `rerun(run_id, edit, policy)` | 위 전부 |
+| `policies` | 정책(FULL/SUFFIX/MEMO/DEP)별로 "이 step 호출을 어떤 기록으로 재사용할 수 있나" 판정 | `choose_reuse(policy, key_static, old, first_dirty_seq, memo_candidates, verify, state_hash) -> StepRecord \| None` | DepGraph, TraceStore |
+| `Equivalence` | pluggable 동등성 oracle: exact / normalized / toolcall-canonical / embedding / llm-judge | `equivalent(a, b, level) -> bool` | 선택적으로 LLM backend |
+| `Runtime` | 워크로드 프로그램을 실행·재실행하며 step 호출마다 REUSE/REBUILD/RERUN/LIVE 결정, 동등성 backdating, 기록 | `run(program, blocks, envs, policy)`, `replay(program, parent_run_id, edit, policy)` | 위 전부 |
 | `LLMBackend` | 통일된 호출 + usage(입력/출력/cached token) 기록 | `complete(prompt, params) -> (text, usage)` | provider SDK |
 | `CostModel` | 예상 비용(uncached prefill, decode) 계산, probe 여부·layout 선택에 사용 | `estimate(prompt, cache_state)` | tokenizer, 실측 usage |
 
@@ -152,31 +152,30 @@ Run        { id, parent_run_id, edit_id, policy: FULL|SUFFIX|MEMO|DEP, layout: n
 
 ### 6.1 기록 (첫 실행)
 
-`@step(reads=[...], writes=[...])` 데코레이터가 step 실행을 감싼다. LLM step은 `ContextAssembler`를 통해서만 prompt를 만든다(직접 문자열 결합 금지 — 그래야 read set이 정확하다). 실행 후 StepRecord를 남기고 Memo에 넣는다.
+워크로드는 `program(ctx)` 형태의 **결정적 Python 함수**(orchestration)이고, 비용이 드는 일은 전부 `@step(kind=...)`로 감싼 함수 호출로만 일어난다. step 함수는 `ctx.block(name)` / `ctx.env(name)` / `ctx.llm(blocks=[...], extra=...)` 로만 상태에 접근하므로 **read set이 실행 중 자동으로 발견·기록**된다(선언 누락 위험 없음). LLM step의 prompt는 `ContextAssembler`가 block 이름 목록으로 조립한다(직접 문자열 결합 금지). 인자로 받은 artifact는 정적 read이고, 반환값은 content-addressed artifact가 된다. 실행 후 StepRecord를 남기고 Memo(constructive trace)에 넣는다.
 
-### 6.2 편집 → 재실행 알고리즘 (policy = DEP)
+### 6.2 편집 → 재실행: 프로그램 재실행 + trace 검증 (Temporal식 replay)
+
+편집 후 runtime은 (1) 원 run의 초기 상태(block·env 버전)를 복원하고 편집을 적용한 뒤 (2) **프로그램을 처음부터 다시 실행**한다. orchestration은 싸고, 각 step 호출에서만 아래를 판정한다:
 
 ```
-1. apply(edit): 대상 block/env의 새 버전 생성
-2. dirty = DepGraph.dirty_from(changed)              # 보수적 도달 집합
-   demanded = 최종 답변·사용자 노출 artifact·커밋 memory의 조상 step 집합   # demand-driven
-   dirty = dirty ∩ demanded                          # 요구되지 않는 dirty step은 건드리지 않음
-   검사 순서: durability가 낮은 block(방금 편집된 것)에 걸린 step부터 → 높은 것은 거의 확인 안 함
-3. for step in 원래 run의 seq 순서 (demanded 안에서만):
-     if step ∉ dirty:                     emit REUSE (기록된 writes 그대로)
-     else:
-       inputs = 현재 버전으로 reads 재해석 (ContextAssembler 재조립)
-       if Memo.hit(kind, hash(inputs)):   emit REUSE-from-memo (호출 없음)
-       elif kind == assemble:             emit REBUILD (결정적 재계산)
-       else:                              emit RERUN (LLM/tool 실제 호출)
-       if Equivalence(new_out, old_out):  # early cutoff
-            new_out을 old_out과 동일 취급 → 이 step 때문에 dirty였던 하위 노드 clean 처리
-       else if 출력이 control flow를 바꿈 (다른 tool/다른 plan):
-            → 여기서부터 LIVE 모드: 에이전트를 실제로 실행, 각 새 step은 Memo만 참조
-4. 새 Run 기록 (parent_run_id=원 run, edit_id)
+key_static = hash(step name, code_version, artifact 인자 id들, 일반 인자값)
+old        = 원 run에서 같은 (name, 등장 순서)의 기록   # 없으면 제어 흐름이 갈라진 것 → LIVE
+DEP:
+  1. verifying trace : old.key_static == key_static 이고 old.reads의 block/env 버전이 모두 현재와 같으면
+                       → REUSE (함수 실행 없이 기록된 writes 적용)
+  2. constructive trace(Memo): 같은 key_static의 다른 기록 중 reads가 검증되는 것이 있으면 → REUSE
+  3. 실행: assemble → REBUILD, llm/tool → RERUN (old 없으면 LIVE)
+  4. backdating(early cutoff): old가 있고 새 출력이 old 출력과 동등(6.3)하면 old artifact를 반환·기록(equivalent_to)
+     → 하위 step은 같은 artifact id를 인자로 받으므로 1에서 자연히 REUSE된다
+SUFFIX: 원 run에서 편집 대상 block/env를 처음 읽은 step의 seq 이전이면 위치(name, 순서)만으로 REUSE, 이후 전부 실행
+        (LangGraph time-travel의 선형 판; 대상을 아무도 안 읽었으면 전부 REUSE)
+MEMO  : LangGraph CachePolicy 모사 — key = hash(name, code_version, 인자, 전체 현재 상태(모든 block·env 버전))가
+        정확히 같은 기록이 있을 때만 REUSE
+FULL  : 항상 실행
 ```
 
-policy = SUFFIX: `dirty = {step | seq ≥ 최초 편집 영향 step의 seq}`. policy = FULL: 전부 RERUN, Memo 미사용.
+L0 동등성은 content-addressed id 덕분에 자동이다(같은 내용 → 같은 id → 하위 key_static 동일). 편집 undo는 원 버전으로 되돌아가므로 즉시 전부 REUSE된다. demand-driven(관찰 4)은 이 모델에서는 "프로그램이 호출하지 않는 step은 애초에 실행되지 않는다"로 실현되며, 요구되지 않는 분기의 명시적 skip은 후속 과제다.
 
 ### 6.3 동등성 oracle과 stale-risk
 
@@ -265,11 +264,11 @@ cost(llm step) ≈ c_pre·(uncached prefill tokens) + c_hit·(cached tokens) + c
 
 ```
 agent_urp/
-  agent_urp/core/      trace_store.py  dep_graph.py  context.py  memo.py  invalidate.py  scheduler.py  equivalence.py  cost.py
-  agent_urp/llm/       base.py  scripted.py  cassette.py  anthropic.py  openai_compat.py (vLLM 겸용)
-  agent_urp/tools/     search.py  db.py  files.py  env.py (버전 있는 mock 환경)
-  workloads/           trip_planner.py  research_pipeline.py  office_task.py
-  eval/                scenarios.py  run_matrix.py  metrics.py  plots.py
+  agent_urp/core/      hashing.py  models.py  trace_store.py  dep_graph.py  context.py  equivalence.py  policies.py  runtime.py  (후속: cost.py)
+  agent_urp/llm/       base.py  scripted.py  cassette.py  (후속: anthropic.py  openai_compat.py — vLLM 겸용)
+  agent_urp/tools/     env.py (버전 있는 mock 환경)  search.py  db.py  (후속: files.py)
+  agent_urp/workloads/ trip_planner.py  (후속: research_pipeline.py  office_task.py)
+  agent_urp/eval/      scenarios.py  metrics.py  run_matrix.py  (후속: plots.py)
   tests/
   docs/
 ```
