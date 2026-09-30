@@ -1,5 +1,7 @@
 """Program runner with record/replay of step calls (spec §6): Temporal-style re-execution of the
-orchestration, verifying/constructive-trace reuse of step results, and equivalence backdating."""
+orchestration, verifying/constructive-trace reuse of step results, and equivalence backdating.
+Memo (constructive-trace) lookup is scoped to the current run and its ancestor runs (lineage), so
+sibling replays of the same parent never reuse each other's records."""
 from __future__ import annotations
 
 import copy
@@ -62,6 +64,7 @@ def code_version_of(fn: Callable[..., Any]) -> str:
 class _Frame:
     reads: dict[tuple[str, str], ReadRef] = field(default_factory=dict)
     writes: list[WriteRef] = field(default_factory=list)
+    written: set[str] = field(default_factory=set)  # blocks set by this step: not reads
     usage: Usage = field(default_factory=Usage)
     llm_calls: int = 0
     params: dict[str, Any] = field(default_factory=dict)
@@ -119,7 +122,7 @@ class StepContext:
         b = self.blocks.get(name)
         if b is None:
             raise UnknownBlock(name)
-        if self._frame is not None:
+        if self._frame is not None and name not in self._frame.written:
             self._frame.reads[("block", name)] = ReadRef(kind="block", name=name, version=b.version)
         return b
 
@@ -135,6 +138,7 @@ class StepContext:
         self._rt.store.put_block(new)
         self.blocks[name] = new
         self._frame.writes.append(WriteRef(kind="block", name=name, version=new.version))
+        self._frame.written.add(name)
         return new
 
     def env(self, name: str) -> VersionedEnv:
@@ -166,12 +170,13 @@ class StepContext:
         args = dict(args or {})
         occ = self._occ.get(name, 0)
         self._occ[name] = occ + 1
-        art_reads = [ReadRef(kind="artifact", name=v.id, version=v.id)
-                     for v in args.values() if isinstance(v, Artifact)]
-        plain = {k: v for k, v in args.items() if not isinstance(v, Artifact)}
+        # Artifact args keyed by parameter name, so swapped arguments never share a key.
+        arts = {k: v.id for k, v in args.items() if isinstance(v, Artifact)}
+        art_reads = [ReadRef(kind="artifact", name=i, version=i) for i in arts.values()]
+        plain = {k: v for k, v in args.items() if k not in arts}
         cv = code_version or code_version_of(fn)
         key_static = content_hash({"name": name, "kind": kind.value, "code_version": cv,
-                                   "artifacts": sorted(r.name for r in art_reads), "args": plain})
+                                   "artifacts": arts, "args": plain})
         state_hash = content_hash({"blocks": {n: b.version for n, b in self.blocks.items()},
                                    "envs": {n: e.version for n, e in self.envs.items()}})
         old = self._parent.get((name, occ))

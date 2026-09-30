@@ -12,7 +12,7 @@ from agent_urp.core.models import (
     SamplingIntent,
     StepKind,
 )
-from agent_urp.core.runtime import NotInStep, Runtime, UnknownBlock, step
+from agent_urp.core.runtime import NotInStep, Runtime, UnknownBlock, UnknownEnv, step
 from agent_urp.core.trace_store import TraceStore
 from agent_urp.llm.scripted import ScriptedLLM
 from agent_urp.tools.env import VersionedEnv
@@ -222,3 +222,66 @@ def test_set_block_records_write_and_is_restored_on_reuse():
     assert base.steps[0].writes[0].kind == "block" and base.steps[0].writes[0].name == "memory.note"
     dep = rt.replay(prog, base.run.id, Edit.of("constraint", "unused", "block", "z"), Policy.DEP)
     assert _names(dep, Decision.REUSE) == ["remember", "use_note"] and dep.output == base.output
+
+
+def test_swapped_artifact_args_rerun_instead_of_stale_reuse():
+    @step(kind=StepKind.TOOL)
+    def combine(ctx, a: Artifact, b: Artifact):
+        return f"{a.content}|{b.content}"
+
+    def prog(ctx):
+        return combine(ctx, a=fetch(ctx, key="x"), b=fetch(ctx, key="y")).content
+    rt = _runtime()
+    base = rt.run(prog, _blocks(), [VersionedEnv("kv", {"x": "1", "y": "2"})])
+    assert base.output == "1|2"
+    swap = Edit.of("tool_result", "kv", "env", {"x": "2", "y": "1"})
+    dep = rt.replay(prog, base.run.id, swap, Policy.DEP)
+    full = rt.replay(prog, base.run.id, swap, Policy.FULL)
+    assert dep.output == full.output == "2|1"
+    assert _names(dep, Decision.RERUN) == ["fetch", "fetch", "combine"]
+
+
+def test_reading_back_own_block_write_is_not_a_read():
+    @step(kind=StepKind.MEMORY)
+    def jot(ctx):
+        ctx.set_block("memory.note", "jotted")
+        return ctx.block("memory.note")
+
+    def prog(ctx):
+        return jot(ctx).content
+    rt = _runtime()
+    base = rt.run(prog, _blocks(), [_env()])
+    assert base.output == "jotted" and base.steps[0].reads == []
+    dep = rt.replay(prog, base.run.id, Edit.of("constraint", "unused", "block", "z"), Policy.DEP)
+    assert _names(dep, Decision.REUSE) == ["jot"] and dep.output == base.output
+
+
+def test_nested_step_raises():
+    @step(kind=StepKind.TOOL)
+    def outer(ctx):
+        return fetch(ctx, key="doc").content
+
+    rt = _runtime()
+    with pytest.raises(NotInStep):
+        rt.run(lambda ctx: outer(ctx), _blocks(), [_env()])
+
+
+def test_unknown_env_raises():
+    rt = _runtime()
+    with pytest.raises(UnknownEnv):
+        rt.run(lambda ctx: ctx.env("missing"), _blocks(), [_env()])
+    base = rt.run(program, _blocks(), [_env()])
+    with pytest.raises(UnknownEnv):
+        rt.replay(program, base.run.id, Edit.of("tool_result", "nope", "env", {"a": 1}), Policy.DEP)
+
+
+def test_sibling_replays_do_not_share_memo():
+    rt = _runtime()
+    base = rt.run(program, _blocks(), [_env()])
+    edit = Edit.of("constraint", "style", "block", "verbose")
+    for policy in (Policy.DEP, Policy.MEMO):
+        first = rt.replay(program, base.run.id, edit, policy)
+        second = rt.replay(program, base.run.id, edit, policy)
+        decisions = [(r.name, r.decision) for r in first.steps]
+        assert Decision.RERUN in {d for _, d in decisions}
+        assert [(r.name, r.decision) for r in second.steps] == decisions
