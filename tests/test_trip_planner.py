@@ -1,4 +1,6 @@
-from agent_urp.core.models import Decision, Edit, Policy
+import pytest
+
+from agent_urp.core.models import Block, Decision, Edit, Policy
 from agent_urp.core.runtime import Runtime
 from agent_urp.core.trace_store import TraceStore
 from agent_urp.workloads import trip_planner as tp
@@ -38,3 +40,29 @@ def test_noop_rephrase_cuts_off_after_pick_hotel():
     dep = rt.replay(tp.program, base.run.id, edit, Policy.DEP)
     assert _names(dep, Decision.RERUN) == ["pick_hotel"]
     assert dep.output.content == base.output.content
+
+
+def _with_budget(text):
+    return [Block.of(b.name, text, kind=b.kind, durability=b.durability)
+            if b.name == "constraint.budget" else b for b in tp.blocks()]
+
+
+def test_budget_with_thousands_separator_is_parsed():
+    rt = Runtime(TraceStore(), tp.scripted_llm())
+    res = rt.run(tp.program, _with_budget("Total budget: at most 1,200 USD"), [tp.env()])
+    assert "stay at Seaside Suites" in res.output.content
+
+
+def test_responders_fail_loudly_on_malformed_prompts():
+    rt = Runtime(TraceStore(), tp.scripted_llm())
+    with pytest.raises(ValueError, match="no budget in prompt"):
+        rt.run(tp.program, _with_budget("Spend whatever it takes"), [tp.env()])
+    with pytest.raises(ValueError, match=r"\[input\]"):
+        tp.scripted_llm().complete('"task": "compose_plan" without an input block')
+
+
+def test_no_flights_for_the_city_fails_loudly():
+    env = tp.env()
+    env.set("tables.flights", [f for f in env.get("tables.flights") if f["city"] != "Jeju"])
+    with pytest.raises(ValueError, match="no flights for Jeju"):
+        Runtime(TraceStore(), tp.scripted_llm()).run(tp.program, tp.blocks(), [env])

@@ -15,7 +15,10 @@ def _jsonable(obj: Any) -> Any:
     if isinstance(obj, Enum):
         return obj.value
     if isinstance(obj, dict):
-        return {str(k): _jsonable(v) for k, v in obj.items()}
+        bad = [k for k in obj if not isinstance(k, str)]
+        if bad:  # no silent str() coercion: {1: x} and {"1": x} must not hash the same
+            raise TypeError(f"dict keys must be str, got {type(bad[0]).__name__} {bad[0]!r}")
+        return {k: _jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_jsonable(v) for v in obj]
     if obj is None or isinstance(obj, (str, int, float, bool)):

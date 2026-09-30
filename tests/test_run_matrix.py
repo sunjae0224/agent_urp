@@ -1,4 +1,10 @@
+from pathlib import Path
+
+import pytest
+
+from agent_urp.core.equivalence import Level
 from agent_urp.core.models import Policy
+from agent_urp.eval import run_matrix
 from agent_urp.eval.run_matrix import format_table, main, run_scenario
 from agent_urp.eval.scenarios import SCENARIOS
 
@@ -28,3 +34,32 @@ def test_cli_prints_table(capsys):
     out = capsys.readouterr().out
     assert "S1" in out and "dep" in out and "executed" in out
     assert "policy" in format_table([{"policy": "dep", "executed": 2}])
+
+
+def test_run_scenario_audits_at_its_level(monkeypatch):
+    levels = []
+    monkeypatch.setattr(run_matrix, "audit",
+                        lambda res, sc, oracle, level: levels.append(level) or {})
+    run_scenario(SCENARIOS["S5"](), [Policy.DEP], Level.L1)
+    assert levels == [Level.L1]
+
+
+@pytest.mark.parametrize(("args", "bad", "valid"), [
+    (["--scenarios", "S1,S9"], "S9", ["S1", "S5"]),
+    (["--policies", "dep,fast"], "fast", ["full", "suffix", "memo", "dep"]),
+    (["--layout", "fancy"], "fancy", ["naive", "stable_prefix"]),
+])
+def test_cli_rejects_unknown_names_and_lists_the_valid_ones(capsys, args, bad, valid):
+    with pytest.raises(SystemExit) as e:
+        main(args)
+    err = capsys.readouterr().err
+    assert e.value.code == 2 and bad in err and all(v in err for v in valid)
+
+
+def test_cli_creates_the_db_parent_directory(tmp_path, monkeypatch):
+    parent_existed = []
+    monkeypatch.setattr(run_matrix, "run_scenario", lambda scenario, policies, level, layout, db:
+                        parent_existed.append(Path(db).parent.is_dir()) or [])
+    db = tmp_path / "runs" / "nested" / "t.sqlite"
+    assert main(["--scenarios", "S5", "--policies", "dep", "--db", str(db)]) == 0
+    assert parent_existed == [True]

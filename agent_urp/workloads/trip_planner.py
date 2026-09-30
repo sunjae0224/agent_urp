@@ -49,7 +49,11 @@ def env() -> VersionedEnv:
 
 @step(kind=StepKind.TOOL)
 def search_flights(ctx: StepContext, city: str) -> list[dict]:
-    return sorted(db_query(ctx.env("travel"), "flights", {"city": city}), key=lambda f: f["price"])
+    flights = sorted(db_query(ctx.env("travel"), "flights", {"city": city}),
+                     key=lambda f: f["price"])
+    if not flights:  # later steps quote the cheapest flight
+        raise ValueError(f"no flights for {city}")
+    return flights
 
 
 @step(kind=StepKind.TOOL)
@@ -88,15 +92,25 @@ def program(ctx: StepContext) -> Artifact:
     return compose_plan(ctx, flights=flights, hotel=hotel, weather=weather)
 
 
-_BUDGET = re.compile(r"(\d{3,6})\s*USD")
+_BUDGET = re.compile(r"(\d{1,3}(?:,\d{3})+|\d{3,6})\s*USD")  # 2000 USD or 1,200 USD
+
+
+def _budget(prompt: str) -> int:
+    m = _BUDGET.search(prompt)
+    if m is None:
+        raise ValueError("no budget in prompt")
+    return int(m.group(1).replace(",", ""))
 
 
 def _extra(prompt: str) -> dict:
-    return json.loads(prompt.split("[input]\n", 1)[1])
+    _, found, data = prompt.partition("[input]\n")
+    if not found:
+        raise ValueError("no [input] block in prompt")
+    return json.loads(data)
 
 
 def _pick_hotel(prompt: str, m: re.Match[str] | None) -> str:
-    budget = int(_BUDGET.search(prompt).group(1))
+    budget = _budget(prompt)
     data = _extra(prompt)
     best = None
     for h in data["hotels"]:

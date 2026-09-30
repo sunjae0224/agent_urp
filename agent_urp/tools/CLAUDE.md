@@ -14,7 +14,7 @@
 
 - **`VersionedEnv.version`**: `content_hash(self.state)` — `name`은 버전에 영향 없다(같은 state → 같은 version, 이름이 달라도). 매번 계산되는 property이지, 캐시된 값이 아니다.
 - **`get(path, default=None)`**: 점(`.`) 구분 경로로 중첩 dict를 읽는다(`e.get("a.b")`); 없으면 `default`, 깊은 복사본을 돌려준다.
-- **`set(path, value)`** / **`update({path: value, ...})`**: 중간 dict를 `setdefault`로 만들며 마지막 키에 값을 쓴다(깊은 복사 저장). state가 바뀌므로 `version`도 바뀐다.
+- **`set(path, value)`** / **`update({path: value, ...})`**: 중간 dict를 `setdefault`로 만들며 마지막 키에 값을 쓴다(깊은 복사 저장). state가 바뀌므로 `version`도 바뀐다. 경로 중간 값이 dict가 아니면 `ValueError("cannot set 'a.b.c': 'a.b' is not a mapping")` — 쓰기 전에 검사하므로 state는 그대로다(`update`는 앞선 경로까지는 이미 쓴 상태로 멈춘다).
 - **`snapshot()`** → `(name, version, deepcopy(state))`; **`VersionedEnv.restore(name, state)`**로 되돌린다. `TraceStore.put_env_snapshot`/`get_env_snapshot`이 이 튜플로 저장·복원한다.
 - **`search`**: query를 공백으로 나눈 단어별로 title+text에서 대소문자 무시 매칭, 맞은 단어 수 내림차순(동점이면 `id` 오름차순)으로 정렬 후 `limit`개.
 - **`db_query`**: `where`의 모든 key=value가 같은 행만 남긴다(등호 필터만, 없으면 전체).
@@ -26,5 +26,5 @@
 
 ## 구현된 것 · 안 된 것
 
-- 구현: dotted-path get/set, snapshot/restore, search, db_query.
+- 구현: dotted-path get/set(dict 아닌 중간 경로는 ValueError), snapshot/restore, search, db_query.
 - 안 됨: env write를 StepRecord에 기록해 DEP가 검증하게 하는 것(core/CLAUDE.md 참고) — 지금은 tool 결과(반환값)만 artifact로 기록되고, env 자체의 변형은 추적 대상이 아니다.

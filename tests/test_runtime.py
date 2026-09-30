@@ -1,3 +1,6 @@
+import itertools
+import re
+
 import pytest
 from pydantic import BaseModel
 
@@ -14,6 +17,7 @@ from agent_urp.core.models import (
     StepKind,
 )
 from agent_urp.core.runtime import (
+    ClosureNotAllowed,
     EnvMutatedInStep,
     NotInStep,
     Runtime,
@@ -186,7 +190,7 @@ def test_fresh_sampling_intent_never_reuses():
     assert _names(dep, Decision.RERUN) == ["sample"]
 
 
-def test_control_flow_divergence_is_live_and_memo_reuses_moved_step():
+def test_control_flow_divergence_keeps_positional_reuse():
     def prog(ctx):
         if ctx.block("style") == "skip":
             return count(ctx, data=fetch(ctx, key="doc")).content
@@ -196,8 +200,27 @@ def test_control_flow_divergence_is_live_and_memo_reuses_moved_step():
     rt = _runtime()
     base = rt.run(prog, _blocks(), [_env()])
     dep = rt.replay(prog, base.run.id, Edit.of("constraint", "style", "block", "skip"), Policy.DEP)
+    # summarize is skipped, yet fetch/count still match the parent's same (name, occurrence)
     assert [(r.name, r.decision) for r in dep.steps] == \
         [("fetch", Decision.REUSE), ("count", Decision.REUSE)]
+    assert [r.reused_from for r in dep.steps] == [base.steps[0].id, base.steps[2].id]
+
+
+def test_divergence_runs_a_new_step_live_and_reuses_a_moved_fetch_via_memo():
+    def prog(ctx):
+        if ctx.block("style") == "skip":
+            return count(ctx, data=fetch(ctx, key="doc")).content  # fetch(doc) is now occurrence 0
+        fetch(ctx, key="other")
+        return summarize(ctx, data=fetch(ctx, key="doc")).content
+    rt = _runtime()
+    env = [VersionedEnv("kv", {"doc": "hello world", "other": "y"})]
+    base = rt.run(prog, _blocks(), env)
+    edit = Edit.of("constraint", "style", "block", "skip")
+    dep = rt.replay(prog, base.run.id, edit, Policy.DEP)
+    assert [(r.name, r.occurrence, r.decision) for r in dep.steps] == \
+        [("fetch", 0, Decision.REUSE), ("count", 0, Decision.LIVE)]
+    assert dep.steps[0].reused_from == base.steps[1].id  # base's fetch(doc), occurrence 1
+    assert dep.output == rt.replay(prog, base.run.id, edit, Policy.FULL).output == 11
 
 
 def test_llm_outside_step_raises_and_non_json_return_raises():
@@ -429,3 +452,159 @@ def test_env_mutation_inside_step_raises():
     rt = _runtime()
     with pytest.raises(EnvMutatedInStep, match=r"poke.*kv"):
         rt.run(lambda ctx: poke(ctx), _blocks(), [_env()])
+
+
+def test_step_context_state_is_private():
+    seen = {}
+
+    def prog(ctx):
+        seen.update(blocks=hasattr(ctx, "blocks"), envs=hasattr(ctx, "envs"))
+        return ctx.block("style")
+    assert _runtime().run(prog, _blocks(), [_env()]).output == "terse"
+    assert seen == {"blocks": False, "envs": False}
+
+
+def test_step_closing_over_program_local_raises():
+    def prog(ctx):
+        mode = ctx.block("mode")
+
+        @step(kind=StepKind.TOOL)
+        def shout(ctx):
+            return mode.upper()
+        return shout(ctx).content
+
+    def prog_ok(ctx):  # the fix: pass the value as a kwarg; closing over callables is fine
+        upper = str.upper
+
+        @step(kind=StepKind.TOOL)
+        def shout(ctx, mode: str):
+            return upper(mode)
+        return shout(ctx, mode=ctx.block("mode")).content
+    rt = _runtime()
+    blocks = _blocks() + [Block.of("mode", "fast")]
+    with pytest.raises(ClosureNotAllowed, match=r"shout.*mode"):
+        rt.run(prog, blocks, [_env()])
+    assert rt.run(prog_ok, blocks, [_env()]).output == "FAST"
+
+
+@step(kind=StepKind.LLM, sampling_intent=SamplingIntent.FRESH)
+def draw(ctx):
+    return ctx.llm(["system"], extra="draw")
+
+
+@step(kind=StepKind.TOOL)
+def echo(ctx, s: Artifact):
+    return s.content
+
+
+@step(kind=StepKind.TOOL)
+def judge(ctx, s: Artifact):
+    return f"{ctx.block('style')}:{s.content}"
+
+
+def fresh_program(ctx):
+    d = draw(ctx)
+    return [d.content, judge(ctx, s=echo(ctx, s=d)).content]
+
+
+def _counter_runtime():
+    n = itertools.count()
+    return Runtime(TraceStore(), ScriptedLLM([(r".*", lambda p, m: f"sample {next(n)}")]))
+
+
+def test_suffix_reuses_fresh_step_positionally_but_dep_redraws():
+    rt = _counter_runtime()
+    base = rt.run(fresh_program, _blocks(), [_env()])
+    assert base.output == ["sample 0", "terse:sample 0"]
+    edit = Edit.of("constraint", "style", "block", "verbose")
+    suffix = rt.replay(fresh_program, base.run.id, edit, Policy.SUFFIX)
+    assert _names(suffix, Decision.REUSE) == ["draw", "echo"]
+    assert suffix.output == ["sample 0", "verbose:sample 0"]  # consistent with the reused echo
+    dep = rt.replay(fresh_program, base.run.id, edit, Policy.DEP)
+    assert _names(dep, Decision.RERUN) == ["draw", "echo", "judge"]
+    assert dep.output == ["sample 1", "verbose:sample 1"]
+
+
+def test_fresh_records_are_never_memoized():
+    rt = _counter_runtime()
+    base = rt.run(fresh_program, _blocks(), [_env()])
+    fresh, stable = base.steps[0], base.steps[1]
+    assert rt.store.memo_candidates(fresh.key_static) == []
+    assert [c.id for c in rt.store.memo_candidates(stable.key_static)] == [stable.id]
+
+
+@step(kind=StepKind.LLM)
+def layout_probe(ctx, names: list):
+    return ctx.llm(names)
+
+
+def _order_runtime():
+    def headers(prompt, m):  # the LLM answers with the block order it was shown
+        return " ".join(re.findall(r"^\[(\w+)\]$", prompt, re.M))
+    return Runtime(TraceStore(), ScriptedLLM([(r".*", headers)]), ContextAssembler("stable_prefix"))
+
+
+def test_run_records_layout_level_and_block_meta():
+    rt = _runtime(Level.L1)
+    stored = rt.store.get_run(rt.run(program, _blocks(), [_env()]).run.id)
+    assert (stored.layout, stored.level) == ("naive", 1)
+    assert stored.block_meta["system"] == {"kind": "static", "durability": "high"}
+
+
+def test_replay_refuses_a_parent_recorded_under_another_layout():
+    store = TraceStore()
+    base = Runtime(store, ScriptedLLM([])).run(program, _blocks(), [_env()])
+    other = Runtime(store, ScriptedLLM([]), ContextAssembler("stable_prefix"))
+    edit = Edit.of("constraint", "style", "block", "verbose")
+    with pytest.raises(ValueError, match=r"'naive'.*'stable_prefix'"):
+        other.replay(program, base.run.id, edit, Policy.DEP)
+    with pytest.raises(KeyError):  # refused before anything (here: the edit row) is stored
+        store.get_edit(edit.id)
+    with pytest.raises(ValueError, match=r"'naive'.*'stable_prefix'"):
+        other.run(program, _blocks(), [_env()], Policy.DEP, parent_run=base.run)
+
+
+def test_replay_restores_each_runs_block_metadata():
+    def prog(ctx):
+        return layout_probe(ctx, names=["system", "style"]).content
+    rt = _order_runtime()
+    swapped = [b.model_copy(update={"durability": d})
+               for b, d in zip(_blocks(), [Durability.LOW, Durability.HIGH, Durability.MEDIUM],
+                               strict=True)]
+    first = rt.run(prog, _blocks(), [_env()])
+    second = rt.run(prog, swapped, [_env()])  # same contents, so the store keeps first's rows
+    assert (first.output, second.output) == ("system style", "style system")
+    edit = Edit.of("constraint", "unused", "block", "z")
+    assert rt.replay(prog, second.run.id, edit, Policy.FULL).output == second.output
+
+
+def test_reused_block_write_keeps_this_runs_block_metadata():
+    @step(kind=StepKind.MEMORY)
+    def note(ctx):
+        ctx.set_block("memo", "noted")
+        return "ok"
+
+    def prog(ctx):
+        note(ctx)
+        return layout_probe(ctx, names=["memo", "style"]).content
+    rt = _order_runtime()
+    style = Block.of("style", "terse", durability=Durability.MEDIUM)
+    rt.run(prog, [Block.of("memo", "", durability=Durability.HIGH), style], [])
+    second = rt.run(prog, [Block.of("memo", "", durability=Durability.LOW), style], [])
+    assert second.output == "style memo"
+    edit = Edit.of("constraint", "style", "block", "verbose")
+    dep = rt.replay(prog, second.run.id, edit, Policy.DEP)
+    assert _names(dep, Decision.REUSE) == ["note"]
+    assert dep.output == rt.replay(prog, second.run.id, edit, Policy.FULL).output == "style memo"
+
+
+def test_suffix_without_edit_diffs_inputs_against_the_parent():
+    rt = _runtime()
+    base = rt.run(program, _blocks(), [_env()])
+    changed = rt.run(program, _blocks("verbose"), [_env()], Policy.SUFFIX, parent_run=base.run)
+    full = rt.run(program, _blocks("verbose"), [_env()], Policy.FULL, parent_run=base.run)
+    assert _names(changed, Decision.REUSE) == ["fetch"] and changed.output == full.output
+    bye = [VersionedEnv("kv", {"doc": "bye"})]
+    env_changed = rt.run(program, _blocks(), bye, Policy.SUFFIX, parent_run=base.run)
+    assert _names(env_changed, Decision.REUSE) == []
+    assert env_changed.output["summary"] == "SUMMARY: BYE"

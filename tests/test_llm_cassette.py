@@ -1,3 +1,6 @@
+import json
+import os
+
 import pytest
 
 from agent_urp.llm.cassette import CassetteLLM, CassetteMiss
@@ -40,3 +43,26 @@ def test_record_mode_always_calls_inner(tmp_path):
 def test_auto_without_inner_on_miss_raises(tmp_path):
     with pytest.raises(CassetteMiss):
         CassetteLLM(tmp_path / "c.json").complete("q")
+
+
+@pytest.mark.parametrize("text", ["", "{\"_backend\": \"scri", "[]"])
+def test_corrupt_file_raises_a_clear_error(tmp_path, text):
+    p = tmp_path / "c.json"
+    p.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match=r"corrupt cassette file: .*c\.json"):
+        CassetteLLM(p)
+
+
+def test_save_replaces_the_file_atomically(tmp_path, monkeypatch):
+    replaced = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        replaced.append((str(src), str(dst)))
+        real_replace(src, dst)
+    monkeypatch.setattr(os, "replace", spy)
+    p = tmp_path / "c.json"
+    CassetteLLM(p, inner=ScriptedLLM([(r".*", "X")])).complete("q")
+    assert replaced == [(f"{p}.tmp", str(p))]
+    assert not (tmp_path / "c.json.tmp").exists()
+    assert json.loads(p.read_text(encoding="utf-8"))["_backend"] == "scripted"

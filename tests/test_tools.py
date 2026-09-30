@@ -1,3 +1,5 @@
+import pytest
+
 from agent_urp.tools.db import db_query
 from agent_urp.tools.env import VersionedEnv
 from agent_urp.tools.search import search
@@ -15,6 +17,16 @@ def test_env_version_tracks_content_and_paths():
     state["a"]["b"] = 999  # snapshot is a copy
     assert e.get("a.b") == 1 and version == e.version
     assert VersionedEnv.restore(name, {"a": {"b": 1, "c": 2}, "x": {"y": 3}}).version == e.version
+
+
+def test_set_through_a_non_mapping_raises_and_leaves_state_alone():
+    e = VersionedEnv("kv", {"a": {"b": 1}, "l": [1]})
+    v0 = e.version
+    with pytest.raises(ValueError, match=r"cannot set 'a\.b\.c': 'a\.b' is not a mapping"):
+        e.set("a.b.c", 2)
+    with pytest.raises(ValueError, match=r"'l' is not a mapping"):
+        e.update({"l.0": 5})
+    assert e.version == v0
 
 
 def test_same_state_same_version():

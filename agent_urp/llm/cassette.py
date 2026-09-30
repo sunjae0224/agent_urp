@@ -1,7 +1,9 @@
-"""Record/replay wrapper: hash(backend, prompt, params) -> response, stored as one JSON file."""
+"""Record/replay wrapper: hash(backend, prompt, params) -> response, stored as one JSON file.
+Saves are atomic (write <path>.tmp, then os.replace); an unreadable file raises ValueError."""
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -27,7 +29,13 @@ class CassetteLLM:
         self.misses = 0
         self._data: dict[str, Any] = {}
         if self.path.exists():
-            self._data = json.loads(self.path.read_text(encoding="utf-8"))
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"corrupt cassette file: {self.path}") from e
+            if not isinstance(data, dict):
+                raise ValueError(f"corrupt cassette file: {self.path}")
+            self._data = data
         inner_name = inner.name if inner is not None else self._data.get("_backend", "none")
         self.name = f"cassette({inner_name})"
 
@@ -37,8 +45,10 @@ class CassetteLLM:
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._data, ensure_ascii=False, indent=1, sort_keys=True),
-                             encoding="utf-8")
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=1, sort_keys=True),
+                       encoding="utf-8")
+        os.replace(tmp, self.path)  # a crash mid-write never leaves a half-written cassette
 
     def complete(self, prompt: str, params: Mapping[str, Any] | None = None) -> LLMResponse:
         key = self._key(prompt, params)

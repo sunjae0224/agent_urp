@@ -41,3 +41,10 @@ def test_content_hash_rejects_unserializable():
         content_hash({1, 2})
     with pytest.raises(TypeError):
         content_hash(object())
+
+
+def test_non_str_dict_keys_are_rejected_not_coerced():
+    for key in (1, 1.5, True, None, ("a",)):
+        with pytest.raises(TypeError, match="keys must be str"):
+            canonical_json({"ok": {key: "v"}})
+    assert canonical_json({Color.RED: 1}) == '{"red":1}'  # StrEnum keys are str

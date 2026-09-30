@@ -146,6 +146,9 @@ class Run(BaseModel):
     edit_id: str | None = None
     policy: Policy
     layout: str = "naive"
+    level: int = 0                                                # equivalence Level of the runtime
     initial_blocks: dict[str, str] = Field(default_factory=dict)  # name -> version
     initial_envs: dict[str, str] = Field(default_factory=dict)    # name -> version
+    # name -> {"kind", "durability"}: block rows are shared by content, this run's metadata is not
+    block_meta: dict[str, dict[str, str]] = Field(default_factory=dict)
     metrics: dict[str, Any] = Field(default_factory=dict)

@@ -30,8 +30,11 @@ class VersionedEnv:
     def set(self, path: str, value: Any) -> None:
         parts = path.split(".")
         node = self.state
-        for part in parts[:-1]:
+        for i, part in enumerate(parts[:-1]):
             node = node.setdefault(part, {})
+            if not isinstance(node, dict):  # checked before any write: state stays untouched
+                prefix = ".".join(parts[:i + 1])
+                raise ValueError(f"cannot set {path!r}: {prefix!r} is not a mapping")
         node[parts[-1]] = copy.deepcopy(value)
 
     def update(self, changes: Mapping[str, Any]) -> None:
