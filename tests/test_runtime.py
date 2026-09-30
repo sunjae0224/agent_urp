@@ -1,4 +1,5 @@
 import pytest
+from pydantic import BaseModel
 
 from agent_urp.core.context import ContextAssembler
 from agent_urp.core.equivalence import Level
@@ -12,7 +13,14 @@ from agent_urp.core.models import (
     SamplingIntent,
     StepKind,
 )
-from agent_urp.core.runtime import NotInStep, Runtime, UnknownBlock, UnknownEnv, step
+from agent_urp.core.runtime import (
+    EnvMutatedInStep,
+    NotInStep,
+    Runtime,
+    UnknownBlock,
+    UnknownEnv,
+    step,
+)
 from agent_urp.core.trace_store import TraceStore
 from agent_urp.llm.scripted import ScriptedLLM
 from agent_urp.tools.env import VersionedEnv
@@ -285,3 +293,139 @@ def test_sibling_replays_do_not_share_memo():
         decisions = [(r.name, r.decision) for r in first.steps]
         assert Decision.RERUN in {d for _, d in decisions}
         assert [(r.name, r.decision) for r in second.steps] == decisions
+
+
+def test_tuple_result_is_canonical_in_both_paths():
+    @step(kind=StepKind.TOOL)
+    def pair(ctx):
+        return (1, 2)
+
+    @step(kind=StepKind.TOOL)
+    def show(ctx, p: Artifact):
+        return f"{ctx.block('style')}:{p.content!r}"
+
+    def prog(ctx):
+        return show(ctx, p=pair(ctx)).content
+    rt = _runtime()
+    base = rt.run(prog, _blocks(), [_env()])
+    edit = Edit.of("constraint", "style", "block", "loud")  # unrelated to pair: only show reads it
+    dep = rt.replay(prog, base.run.id, edit, Policy.DEP)
+    full = rt.replay(prog, base.run.id, edit, Policy.FULL)
+    assert _names(dep, Decision.REUSE) == ["pair"] and _names(dep, Decision.RERUN) == ["show"]
+    assert dep.output == full.output == "loud:[1, 2]"
+
+
+def test_pydantic_model_result_is_a_dict_in_both_paths():
+    class Point(BaseModel):
+        x: int
+        y: int
+
+    @step(kind=StepKind.TOOL)
+    def origin(ctx):
+        return Point(x=0, y=0)
+
+    def prog(ctx):
+        return origin(ctx).content
+    rt = _runtime()
+    base = rt.run(prog, _blocks(), [_env()])
+    dep = rt.replay(prog, base.run.id, Edit.of("constraint", "unused", "block", "z"), Policy.DEP)
+    assert _names(dep, Decision.REUSE) == ["origin"]
+    assert type(base.output) is dict and type(dep.output) is dict
+    assert base.output == dep.output == {"x": 0, "y": 0}
+
+
+def test_set_block_stores_a_copy():
+    @step(kind=StepKind.MEMORY)
+    def keep(ctx):
+        notes = ["a"]
+        ctx.set_block("memory.notes", notes)
+        notes.append("b")
+        return ctx.block("memory.notes")
+
+    rt = _runtime()
+    assert rt.run(lambda ctx: keep(ctx).content, _blocks(), [_env()]).output == ["a"]
+
+
+def test_run_inputs_are_canonical_so_base_matches_replay():
+    @step(kind=StepKind.TOOL)
+    def show(ctx):
+        return f"{ctx.block('pair')!r} {ctx.env('kv').get('pair')!r}"
+
+    def prog(ctx):
+        return show(ctx).content
+    rt = _runtime()
+    base = rt.run(prog, _blocks() + [Block.of("pair", (1, 2))],
+                  [VersionedEnv("kv", {"pair": (3, 4)})])
+    edit = Edit.of("constraint", "unused", "block", "z")
+    dep = rt.replay(prog, base.run.id, edit, Policy.DEP)
+    full = rt.replay(prog, base.run.id, edit, Policy.FULL)
+    assert _names(dep, Decision.REUSE) == ["show"]
+    assert dep.output == full.output == "[1, 2] [3, 4]"
+
+
+def test_suffix_sees_orchestration_reads():
+    def prog(ctx):
+        return fetch(ctx, key=ctx.block("which")).content
+    rt = _runtime()
+    base = rt.run(prog, _blocks() + [Block.of("which", "doc")],
+                  [VersionedEnv("kv", {"doc": "x", "other": "y"})])
+    assert [(r.kind, r.name) for r in base.steps[0].orchestration_reads] == [("block", "which")]
+    edit = Edit.of("constraint", "which", "block", "other")
+    suffix = rt.replay(prog, base.run.id, edit, Policy.SUFFIX)
+    full = rt.replay(prog, base.run.id, edit, Policy.FULL)
+    assert suffix.output == full.output == "y"
+    assert _names(suffix, Decision.RERUN) == ["fetch"]
+
+
+def test_dep_ignores_orchestration_reads_and_reuse_records_current_ones():
+    def prog(ctx):
+        ctx.block("style")
+        return fetch(ctx, key="doc").content
+    rt = _runtime()
+    base = rt.run(prog, _blocks(), [_env()])
+    dep = rt.replay(prog, base.run.id, Edit.of("constraint", "style", "block", "verbose"),
+                    Policy.DEP)
+    assert _names(dep, Decision.REUSE) == ["fetch"]
+    assert [r.version for r in dep.steps[0].orchestration_reads] == \
+        [Block.of("style", "verbose").version]
+
+
+def test_read_before_own_write_is_still_a_read():
+    @step(kind=StepKind.MEMORY)
+    def restyle(ctx):
+        before = ctx.block("style")
+        ctx.set_block("style", before + "!")
+        return ctx.block("style")
+
+    rt = _runtime()
+    res = rt.run(lambda ctx: restyle(ctx).content, _blocks(), [_env()])
+    assert res.output == "terse!"
+    assert [(r.kind, r.name, r.version) for r in res.steps[0].reads] == \
+        [("block", "style", _blocks()[1].version)]
+
+
+def test_set_block_outside_step_raises():
+    rt = _runtime()
+    with pytest.raises(NotInStep):
+        rt.run(lambda ctx: ctx.set_block("memory.note", "x"), _blocks(), [_env()])
+
+
+def test_backdating_only_under_dep():
+    rt = _runtime(Level.L1)
+    base = rt.run(program, _blocks(), [_env()])
+    edit = Edit.of("constraint", "style", "block", "verbose")
+    for policy in (Policy.SUFFIX, Policy.MEMO, Policy.FULL):
+        res = rt.replay(program, base.run.id, edit, policy)
+        assert all(r.equivalent_to is None for r in res.steps)
+        assert "polish" in _names(res, Decision.RERUN)
+
+
+def test_env_mutation_inside_step_raises():
+    @step(kind=StepKind.TOOL)
+    def poke(ctx):
+        ctx.env("kv").set("doc", "changed")
+        return "ok"
+
+    rt = _runtime()
+    with pytest.raises(EnvMutatedInStep, match=r"poke.*kv"):
+        rt.run(lambda ctx: poke(ctx), _blocks(), [_env()])

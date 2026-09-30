@@ -41,3 +41,17 @@ def test_dirty_from_follows_artifacts():
 
 def test_to_dot_mentions_steps():
     assert "pick" in _graph().to_dot()
+
+
+def test_readers_of_sees_orchestration_reads():
+    fetch = _rec(1, "fetch", [ReadRef(kind="env", name="kv", version="e1")],
+                 [WriteRef(kind="artifact", name="a1", version="a1")])
+    fetch = fetch.model_copy(update={
+        "orchestration_reads": [ReadRef(kind="block", name="which", version="w1")]})
+    use = _rec(2, "use", [ReadRef(kind="artifact", name="a1", version="a1")],
+               [WriteRef(kind="artifact", name="a2", version="a2")])
+    g = DepGraph.from_steps([fetch, use])
+    assert [r.name for r in g.readers_of("which")] == ["fetch"]
+    assert g.first_dirty_seq(["which"]) == 1
+    assert g.dirty_from(["which"]) == {"r:0001", "r:0002"}
+    assert g.g.has_edge("block:which@w1", "step:r:0001")

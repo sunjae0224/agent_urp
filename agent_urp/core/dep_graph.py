@@ -1,6 +1,7 @@
 """Dependency graph reconstructed from step records (spec §4):
 
 block/env/artifact -> step -> artifact/block.
+A step's orchestration_reads (program reads just before it) count as reads of that step.
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ class DepGraph:
         for s in self.steps:
             sid = f"step:{s.id}"
             self.g.add_node(sid, kind="step", name=s.name)
-            for r in s.reads:
+            for r in [*s.reads, *s.orchestration_reads]:
                 self.g.add_edge(_node(r), sid)
             for w in s.writes:
                 self.g.add_edge(sid, _node(w))
@@ -36,7 +37,8 @@ class DepGraph:
 
     def readers_of(self, name: str) -> list[StepRecord]:
         return [s for s in self.steps
-                if any(r.kind in ("block", "env") and r.name == name for r in s.reads)]
+                if any(r.kind in ("block", "env") and r.name == name
+                       for r in [*s.reads, *s.orchestration_reads])]
 
     def first_dirty_seq(self, names: Iterable[str]) -> int | None:
         seqs = [s.seq for n in names for s in self.readers_of(n)]

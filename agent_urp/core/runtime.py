@@ -1,12 +1,16 @@
 """Program runner with record/replay of step calls (spec §6): Temporal-style re-execution of the
 orchestration, verifying/constructive-trace reuse of step results, and equivalence backdating.
 Memo (constructive-trace) lookup is scoped to the current run and its ancestor runs (lineage), so
-sibling replays of the same parent never reuse each other's records."""
+sibling replays of the same parent never reuse each other's records. Run inputs, step results and
+set_block contents are canonicalized to their JSON round-trip, so executed and reused values are
+identical. Program reads outside any step are recorded on the next step as orchestration_reads
+(SUFFIX sees them; DEP does not verify them). Steps must not mutate envs (v1)."""
 from __future__ import annotations
 
 import copy
 import functools
 import inspect
+import json
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -15,7 +19,7 @@ from typing import Any
 from agent_urp.core.context import ContextAssembler
 from agent_urp.core.dep_graph import DepGraph
 from agent_urp.core.equivalence import Level, equivalent
-from agent_urp.core.hashing import content_hash
+from agent_urp.core.hashing import canonical_json, content_hash
 from agent_urp.core.models import (
     Artifact,
     Block,
@@ -52,12 +56,21 @@ class NotInStep(RuntimeError):
     pass
 
 
+class EnvMutatedInStep(RuntimeError):
+    pass
+
+
 def code_version_of(fn: Callable[..., Any]) -> str:
     try:
         src = inspect.getsource(fn)
     except (OSError, TypeError):
         src = getattr(fn, "__qualname__", repr(fn))
     return content_hash(src)
+
+
+def _canonical(value: Any) -> Any:
+    """JSON round-trip of value: exactly what the store gives back, as a fresh copy."""
+    return json.loads(canonical_json(value))
 
 
 @dataclass
@@ -115,15 +128,22 @@ class StepContext:
         self._occ: dict[str, int] = {}
         self._seq = 0
         self._frame: _Frame | None = None
+        # reads made outside any step; attached to the next step as orchestration_reads
+        self._pending: dict[tuple[str, str], ReadRef] = {}
         self.records: list[StepRecord] = []
 
-    # --- state access (records reads/writes when inside a step) ---------------
+    # --- state access (records reads/writes; reads outside a step are pending) --
+    def _record_read(self, ref: ReadRef) -> None:
+        if self._frame is None:
+            self._pending[(ref.kind, ref.name)] = ref
+        elif not (ref.kind == "block" and ref.name in self._frame.written):
+            self._frame.reads[(ref.kind, ref.name)] = ref
+
     def _block_obj(self, name: str) -> Block:
         b = self.blocks.get(name)
         if b is None:
             raise UnknownBlock(name)
-        if self._frame is not None and name not in self._frame.written:
-            self._frame.reads[("block", name)] = ReadRef(kind="block", name=name, version=b.version)
+        self._record_read(ReadRef(kind="block", name=name, version=b.version))
         return b
 
     def block(self, name: str) -> Any:
@@ -133,7 +153,7 @@ class StepContext:
         if self._frame is None:
             raise NotInStep("set_block() is only allowed inside a step")
         old = self.blocks.get(name)
-        new = Block.of(name, content, kind=old.kind if old else BlockKind.DERIVED,
+        new = Block.of(name, _canonical(content), kind=old.kind if old else BlockKind.DERIVED,
                        durability=old.durability if old else Durability.MEDIUM)
         self._rt.store.put_block(new)
         self.blocks[name] = new
@@ -145,8 +165,7 @@ class StepContext:
         e = self.envs.get(name)
         if e is None:
             raise UnknownEnv(name)
-        if self._frame is not None:
-            self._frame.reads[("env", name)] = ReadRef(kind="env", name=name, version=e.version)
+        self._record_read(ReadRef(kind="env", name=name, version=e.version))
         return e
 
     def llm(self, blocks: Sequence[str], extra: str = "",
@@ -167,6 +186,8 @@ class StepContext:
              sampling_intent: SamplingIntent = SamplingIntent.STABLE) -> Artifact:
         if self._frame is not None:
             raise NotInStep("nested steps are not supported")
+        orch_reads = sorted(self._pending.values(), key=lambda r: (r.kind, r.name))
+        self._pending = {}
         args = dict(args or {})
         occ = self._occ.get(name, 0)
         self._occ[name] = occ + 1
@@ -195,19 +216,25 @@ class StepContext:
             self._apply_writes(reuse)
             rec = reuse.model_copy(update={"id": step_id, "run_id": self.run.id, "seq": seq,
                                            "occurrence": occ, "decision": Decision.REUSE,
+                                           "orchestration_reads": orch_reads,
                                            "usage": Usage(), "llm_calls": 0, "tool_calls": 0,
                                            "equivalent_to": None, "reused_from": reuse.id})
             self._rt.store.record_step(rec)
             self.records.append(rec)
             return self._output_of(rec)
 
+        envs_before = {n: e.version for n, e in self.envs.items()}
         frame = _Frame()
         self._frame = frame
         try:
             result = fn(self, **args)
         finally:
             self._frame = None
-        out = Artifact.of(kind.value, result, created_by=step_id)
+        mutated = sorted(n for n, e in self.envs.items() if e.version != envs_before[n])
+        if mutated:
+            raise EnvMutatedInStep(f"step {name!r} mutated env {', '.join(mutated)}; env writes "
+                                   "inside steps are not supported in v1")
+        out = Artifact.of(kind.value, _canonical(result), created_by=step_id)
         self._rt.store.put_artifact(out)
         decision = Decision.LIVE if old is None else (
             Decision.REBUILD if kind == StepKind.ASSEMBLE else Decision.RERUN)
@@ -220,7 +247,7 @@ class StepContext:
         writes = frame.writes + [WriteRef(kind="artifact", name=out.id, version=out.id)]
         rec = StepRecord(
             id=step_id, run_id=self.run.id, seq=seq, name=name, occurrence=occ, kind=kind,
-            key_static=key_static, reads=reads,
+            key_static=key_static, reads=reads, orchestration_reads=orch_reads,
             params={"args": plain, "state_hash": state_hash, **frame.params},
             sampling_intent=sampling_intent, code_version=cv,
             input_hash=content_hash({"key_static": key_static, "reads": reads}),
@@ -264,6 +291,8 @@ class Runtime:
     def run(self, program: Program, blocks: Sequence[Block], envs: Sequence[VersionedEnv],
             policy: Policy = Policy.FULL, parent_run: Run | None = None,
             edit: Edit | None = None) -> RunResult:
+        blocks = [b.model_copy(update={"content": _canonical(b.content)}) for b in blocks]
+        envs = [VersionedEnv.restore(e.name, _canonical(e.state)) for e in envs]
         run = Run(id=uuid.uuid4().hex[:12], parent_run_id=parent_run.id if parent_run else None,
                   edit_id=edit.id if edit else None, policy=policy, layout=self.assembler.layout,
                   initial_blocks={b.name: b.version for b in blocks},

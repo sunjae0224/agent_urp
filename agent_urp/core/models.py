@@ -109,6 +109,8 @@ class StepRecord(BaseModel):
     kind: StepKind
     key_static: str
     reads: list[ReadRef] = Field(default_factory=list)
+    # reads made by the program (outside any step) since the previous step; DEP does not verify them
+    orchestration_reads: list[ReadRef] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
     sampling_intent: SamplingIntent = SamplingIntent.STABLE
     code_version: str
