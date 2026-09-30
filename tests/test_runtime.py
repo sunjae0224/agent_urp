@@ -1,0 +1,224 @@
+import pytest
+
+from agent_urp.core.context import ContextAssembler
+from agent_urp.core.equivalence import Level
+from agent_urp.core.models import (
+    Artifact,
+    Block,
+    Decision,
+    Durability,
+    Edit,
+    Policy,
+    SamplingIntent,
+    StepKind,
+)
+from agent_urp.core.runtime import NotInStep, Runtime, UnknownBlock, step
+from agent_urp.core.trace_store import TraceStore
+from agent_urp.llm.scripted import ScriptedLLM
+from agent_urp.tools.env import VersionedEnv
+
+
+def _summarize_rule(prompt, m):
+    extra = prompt.split("[input]\n", 1)[1]
+    return f"SUMMARY: {extra.strip()}" + ("  " if "verbose" in prompt else "")
+
+
+@step(kind=StepKind.TOOL)
+def fetch(ctx, key: str):
+    return ctx.env("kv").get(key)
+
+
+@step(kind=StepKind.LLM)
+def summarize(ctx, data: Artifact):
+    return ctx.llm(["system", "style"], extra=str(data.content))
+
+
+@step(kind=StepKind.TOOL)
+def count(ctx, data: Artifact):
+    return len(str(data.content))
+
+
+@step(kind=StepKind.TOOL)
+def polish(ctx, s: Artifact):
+    return s.content.strip().upper()
+
+
+def program(ctx):
+    d = fetch(ctx, key="doc")
+    s = summarize(ctx, data=d)
+    c = count(ctx, data=d)
+    p = polish(ctx, s=s)
+    return {"summary": p.content, "count": c.content}
+
+
+def _blocks(style="terse"):
+    return [Block.of("system", "You summarize.", durability=Durability.HIGH),
+            Block.of("style", style, durability=Durability.LOW),
+            Block.of("unused", "nobody reads me")]
+
+
+def _env():
+    return VersionedEnv("kv", {"doc": "hello world"})
+
+
+def _runtime(level=Level.L0):
+    return Runtime(TraceStore(), ScriptedLLM([(r".*", _summarize_rule)]),
+                   ContextAssembler("naive"), level)
+
+
+def _names(result, decision=None):
+    return [r.name for r in result.steps if decision is None or r.decision == decision]
+
+
+def test_first_run_records_everything_as_live():
+    rt = _runtime()
+    res = rt.run(program, _blocks(), [_env()])
+    assert res.output == {"summary": "SUMMARY: HELLO WORLD", "count": 11}
+    assert _names(res) == ["fetch", "summarize", "count", "polish"]
+    assert all(r.decision == Decision.LIVE for r in res.steps)
+    fetch_rec, sum_rec = res.steps[0], res.steps[1]
+    assert [r.kind for r in fetch_rec.reads] == ["env"] and fetch_rec.tool_calls == 1
+    assert {(r.kind, r.name) for r in sum_rec.reads} == {("artifact", fetch_rec.writes[-1].name),
+                                                          ("block", "system"), ("block", "style")}
+    assert sum_rec.llm_calls == 1 and sum_rec.usage.input_tokens > 0
+    assert res.metrics["llm_calls"] == 1 and res.metrics["tool_calls"] == 3
+    assert rt.store.get_run(res.run.id).initial_blocks["style"] == _blocks()[1].version
+
+
+def test_replay_policies_on_style_edit():
+    rt = _runtime()
+    base = rt.run(program, _blocks(), [_env()])
+    edit = Edit.of("constraint", "style", "block", "verbose")
+    dep = rt.replay(program, base.run.id, edit, Policy.DEP)
+    assert _names(dep, Decision.REUSE) == ["fetch", "count"]
+    assert _names(dep, Decision.RERUN) == ["summarize", "polish"]
+    assert dep.run.parent_run_id == base.run.id and dep.run.edit_id == edit.id
+    suffix = rt.replay(program, base.run.id, edit, Policy.SUFFIX)
+    assert _names(suffix, Decision.REUSE) == ["fetch"]
+    memo = rt.replay(program, base.run.id, edit, Policy.MEMO)
+    assert _names(memo, Decision.REUSE) == []
+    full = rt.replay(program, base.run.id, edit, Policy.FULL)
+    assert _names(full, Decision.REUSE) == [] and full.output == dep.output == suffix.output
+    assert rt.store.get_edit(edit.id).old_version == _blocks()[1].version
+
+
+def test_l1_backdating_stops_propagation():
+    rt = _runtime(Level.L1)
+    base = rt.run(program, _blocks(), [_env()])
+    edit = Edit.of("constraint", "style", "block", "verbose")
+    dep = rt.replay(program, base.run.id, edit, Policy.DEP)
+    assert _names(dep, Decision.RERUN) == ["summarize"]
+    assert _names(dep, Decision.REUSE) == ["fetch", "count", "polish"]
+    assert dep.steps[1].equivalent_to == base.steps[1].id
+    rt0 = _runtime(Level.L0)
+    base0 = rt0.run(program, _blocks(), [_env()])
+    assert _names(rt0.replay(program, base0.run.id, edit, Policy.DEP), Decision.RERUN) == \
+        ["summarize", "polish"]
+
+
+def test_undo_edit_reuses_everything():
+    rt = _runtime()
+    base = rt.run(program, _blocks(), [_env()])
+    e1 = Edit.of("constraint", "style", "block", "verbose")
+    mid = rt.replay(program, base.run.id, e1, Policy.DEP)
+    back = rt.replay(program, mid.run.id, Edit.of("constraint", "style", "block", "terse"),
+                     Policy.DEP)
+    assert _names(back, Decision.REUSE) == ["fetch", "summarize", "count", "polish"]
+    assert back.output == base.output
+
+
+def test_env_edit_invalidates_tool_readers():
+    rt = _runtime()
+    base = rt.run(program, _blocks(), [_env()])
+    dep = rt.replay(program, base.run.id, Edit.of("tool_result", "kv", "env", {"doc": "bye"}),
+                    Policy.DEP)
+    assert _names(dep, Decision.RERUN) == ["fetch", "summarize", "count", "polish"]
+    assert dep.output["summary"] == "SUMMARY: BYE"
+
+
+def test_suffix_target_never_read():
+    rt = _runtime()
+    base = rt.run(program, _blocks(), [_env()])
+    edit = Edit.of("system", "unused", "block", "still unread")
+    assert _names(rt.replay(program, base.run.id, edit, Policy.SUFFIX), Decision.REUSE) == \
+        ["fetch", "summarize", "count", "polish"]
+    assert _names(rt.replay(program, base.run.id, edit, Policy.DEP), Decision.REUSE) == \
+        ["fetch", "summarize", "count", "polish"]
+
+
+def test_unknown_block_edit_raises():
+    rt = _runtime()
+    base = rt.run(program, _blocks(), [_env()])
+    with pytest.raises(UnknownBlock):
+        rt.replay(program, base.run.id, Edit.of("constraint", "nope", "block", "x"), Policy.DEP)
+
+
+def test_same_step_twice_tracks_occurrence():
+    def prog(ctx):
+        a = fetch(ctx, key="doc")
+        b = fetch(ctx, key="other")
+        return [a.content, b.content]
+    rt = _runtime()
+    base = rt.run(prog, _blocks(), [VersionedEnv("kv", {"doc": "x", "other": "y"})])
+    assert [(r.name, r.occurrence) for r in base.steps] == [("fetch", 0), ("fetch", 1)]
+    dep = rt.replay(prog, base.run.id, Edit.of("constraint", "style", "block", "v"), Policy.DEP)
+    assert _names(dep, Decision.REUSE) == ["fetch", "fetch"] and dep.output == ["x", "y"]
+
+
+def test_fresh_sampling_intent_never_reuses():
+    @step(kind=StepKind.LLM, sampling_intent=SamplingIntent.FRESH)
+    def sample(ctx):
+        return ctx.llm(["system"], extra="draw")
+
+    def prog(ctx):
+        return sample(ctx).content
+    rt = _runtime()
+    base = rt.run(prog, _blocks(), [_env()])
+    dep = rt.replay(prog, base.run.id, Edit.of("constraint", "unused", "block", "z"), Policy.DEP)
+    assert _names(dep, Decision.RERUN) == ["sample"]
+
+
+def test_control_flow_divergence_is_live_and_memo_reuses_moved_step():
+    def prog(ctx):
+        if ctx.block("style") == "skip":
+            return count(ctx, data=fetch(ctx, key="doc")).content
+        d = fetch(ctx, key="doc")
+        summarize(ctx, data=d)
+        return count(ctx, data=d).content
+    rt = _runtime()
+    base = rt.run(prog, _blocks(), [_env()])
+    dep = rt.replay(prog, base.run.id, Edit.of("constraint", "style", "block", "skip"), Policy.DEP)
+    assert [(r.name, r.decision) for r in dep.steps] == \
+        [("fetch", Decision.REUSE), ("count", Decision.REUSE)]
+
+
+def test_llm_outside_step_raises_and_non_json_return_raises():
+    rt = _runtime()
+    with pytest.raises(NotInStep):
+        rt.run(lambda ctx: ctx.llm(["system"]), _blocks(), [_env()])
+
+    @step(kind=StepKind.TOOL)
+    def bad(ctx):
+        return {1, 2}
+    with pytest.raises(TypeError):
+        rt.run(lambda ctx: bad(ctx), _blocks(), [_env()])
+
+
+def test_set_block_records_write_and_is_restored_on_reuse():
+    @step(kind=StepKind.MEMORY)
+    def remember(ctx):
+        ctx.set_block("memory.note", "seen " + str(ctx.env("kv").get("doc")))
+        return "ok"
+
+    @step(kind=StepKind.LLM)
+    def use_note(ctx):
+        return ctx.llm(["memory.note"], extra="x")
+
+    def prog(ctx):
+        remember(ctx)
+        return use_note(ctx).content
+    rt = _runtime()
+    base = rt.run(prog, _blocks(), [_env()])
+    assert base.steps[0].writes[0].kind == "block" and base.steps[0].writes[0].name == "memory.note"
+    dep = rt.replay(prog, base.run.id, Edit.of("constraint", "unused", "block", "z"), Policy.DEP)
+    assert _names(dep, Decision.REUSE) == ["remember", "use_note"] and dep.output == base.output
