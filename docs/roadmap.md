@@ -13,7 +13,7 @@
 
 | 역할 | 담당 컴포넌트 | 산출물 |
 |---|---|---|
-| R1 Runtime core | `core/` (TraceStore, DepGraph, Invalidator, Memo, Scheduler) | 선택적 재실행 엔진, 속성 테스트 |
+| R1 Runtime core | `core/` (TraceStore, DepGraph, policies, Runtime; Memo는 TraceStore의 `key_static` 색인) | 선택적 재실행 엔진, 속성 테스트 |
 | R2 Workload & Eval | `tools/`, `workloads/`, `eval/` | mock 환경(버전 있음), S1~S6, 베이스라인 실행 매트릭스, 지표·그림 |
 | R3 Context & Cache | `core/context.py`, `core/cost.py`, `llm/` | block layout 정책, 비용 모델, API 캐시 실측, (후반) vLLM 백엔드 |
 
@@ -23,13 +23,15 @@
 |---|---|---|---|
 | ~10/5 | W0 준비 | 스펙 검토·확정, repo·uv·API 키·pre-commit 세팅, 역할 확정 | 스펙 승인, `uv run pytest` 빈 테스트 통과 |
 | 10/6–10/17 | **Phase 0 학습** | study-guide 1~2주차 완료. 각자 *프레임워크 없이* ReAct 루프 + mock tool 2개 구현(≤150 LOC). LangGraph persistence/time-travel 튜토리얼 1회 실습. 리딩 세미나 4편 | 3명 모두 toy 에이전트 동작, 세미나 노트 `docs/notes/` |
-| 10/20–10/31 | **Phase 1 Runtime core** | `@step(reads, writes)`, TraceStore(SQLite), DepGraph, ContextAssembler(naive), scripted LLM + cassette, FULL/SUFFIX 정책, S1·S2 워크로드 v0 | 기록된 run을 cassette로 재생 가능; FULL/SUFFIX 결과표 1장 |
-| 11/3–11/14 | **Phase 2 선택적 재실행** | Invalidator(dirty propagation), Memo(constructive trace), Equivalence L0~L2, DEP 정책, 구조 분기 시 LIVE 전환, S1~S6, stale audit | 속성 테스트(DEP==FULL, no-op→호출≤1, undo 즉시 복원) 통과; S1~S6 × FULL/SUFFIX/DEP 결과표 |
+| 10/20–10/31 | **Phase 1 Runtime core** | `@step(kind)`(read/write 실행 중 자동 기록), TraceStore(SQLite), DepGraph, ContextAssembler(naive), scripted LLM + cassette, FULL/SUFFIX 정책, S1·S2 워크로드 v0 — **2026-09-30 완료(S2 워크로드 제외)** | 기록된 run을 cassette로 재생 가능; FULL/SUFFIX 결과표 1장 |
+| 11/3–11/14 | **Phase 2 선택적 재실행** | policies/Runtime(DEP: 기록된 read 검증, backdating early cutoff), Memo(constructive trace), Equivalence L0~L2, DEP 정책, 구조 분기 시 LIVE 전환, S1~S6, stale audit | 속성 테스트(DEP==FULL, no-op→호출≤1, undo 즉시 복원) 통과; S1~S6 × FULL/SUFFIX/DEP 결과표 |
 | 11/17–11/28 | **Phase 3 Cache-aware** | block layout 정책(naive/stable_prefix), CostModel, Anthropic/OpenAI cached_tokens 실측, probe 순서 정책, Equivalence L3/L4 실험(절감 vs stale 곡선). **선택**: 4090에 vLLM APC 올려 TTFT/prefill 실측 | DEP+cache(+layout) 축 추가된 결과표; 캐시 실측이 비용 모델과 ±20% 이내 |
 | 12/1–12/12 | **Phase 4 평가·집필** | 전체 매트릭스(시나리오×정책×동등성 수준×N회), ablation, 그림, 보고서 초고(워크숍 논문 구조) | 12/12 초고 완성, 재현 스크립트 1개로 전 결과 재생 |
 | 12/15–12/18 | 마감 | 리뷰 반영, 데모 영상/README, 코드 정리 | 12/18 제출 |
 
 버퍼는 Phase 4 안의 1주. Phase 3의 GPU 항목이 밀리면 부록으로 내린다.
+
+**진행 현황(2026-09-30)**: v1 skeleton(`feat/skeleton-v1`)으로 Phase 1 핵심 항목을 끝냈다(S2 워크로드 제외). Phase 2 중 DEP 정책·Memo·Equivalence L0/L1·LIVE 전환·stale audit·S1/S5 시나리오·MEMO 베이스라인도 이미 들어가 있다. 일정은 다시 짜지 않았다 — 남은 항목(S2~S4·S6, Equivalence L2, 실제 API 백엔드, 비용 모델)은 원래 phase에서 한다.
 
 ## GPU-free → GPU 확장 경로
 

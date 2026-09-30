@@ -20,7 +20,7 @@
 - `test_trip_planner.py` — S1 end-to-end: 예산 2000→Ocean Grand, 1200(또는 `1,200`)→Seaside Suites, no-op 재표현은 pick_hotel만 RERUN; 예산 없음·`[input]` 없음·항공편 없음은 명확한 ValueError.
 - `test_metrics.py` — `audit`: 컨테이너(dict/list) 안의 artifact도 내용으로 비교, `matches_full`은 주어진 level로 판정(L1 공백 차이).
 - `test_run_matrix.py` — S1/S5의 정확한 executed/over_rerun/llm_calls 수치, CLI 출력, `run_scenario`가 level을 audit에 전달, 모르는 시나리오/정책/layout 거부(유효 이름 나열), `--db` 부모 폴더 생성.
-- `test_claude_md.py` — 이 문서 체계 자체: `.py` 있는 모든 폴더에 CLAUDE.md 존재, 전부 50줄 이하, 루트에 갱신 규칙 언급.
+- `test_claude_md.py` — 이 문서 체계 자체: `.py` 있는 모든 폴더에 CLAUDE.md 존재, 전부 50줄 이하, 루트에 갱신 규칙 언급, `- sub/ → sub/CLAUDE.md` 지도 줄에 설명(` — `) 없음.
 
 ## 규칙
 

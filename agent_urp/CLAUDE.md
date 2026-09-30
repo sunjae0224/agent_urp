@@ -4,11 +4,11 @@
 
 ## 하위 폴더
 
-- agent_urp/core/ → agent_urp/core/CLAUDE.md — 모델·해싱·trace store·dep graph·동등성·정책·runtime
-- agent_urp/llm/ → agent_urp/llm/CLAUDE.md — LLM 백엔드
-- agent_urp/tools/ → agent_urp/tools/CLAUDE.md — mock 환경·tool
-- agent_urp/workloads/ → agent_urp/workloads/CLAUDE.md — 평가용 워크로드
-- agent_urp/eval/ → agent_urp/eval/CLAUDE.md — 시나리오·지표·CLI
+- agent_urp/core/ → agent_urp/core/CLAUDE.md
+- agent_urp/llm/ → agent_urp/llm/CLAUDE.md
+- agent_urp/tools/ → agent_urp/tools/CLAUDE.md
+- agent_urp/workloads/ → agent_urp/workloads/CLAUDE.md
+- agent_urp/eval/ → agent_urp/eval/CLAUDE.md
 
 ## import 계층
 

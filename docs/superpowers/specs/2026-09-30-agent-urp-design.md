@@ -1,7 +1,7 @@
 # agent_urp 설계 스펙 — LLM Agent 의존성 기반 선택적 재실행 Runtime
 
 - 작성일: 2026-09-30 (연구기간 2026-08-31 ~ 2026-12-18, 남은 기간 약 11주)
-- 상태: **초안 — 사용자 검토 대기**. 구현은 이 문서 승인 후 `docs/superpowers/plans/`의 구현 계획을 거쳐 시작한다.
+- 상태: **v1 skeleton 구현 반영 (2026-09-30)**. 구현 계획은 `docs/superpowers/plans/2026-09-30-skeleton-v1.md`이고, 구현 중 내려진 판정은 §2(v1 주의)·§4·§5·§6·§8.3에 반영했다. §13 열린 질문은 여전히 사용자 결정 대기.
 - 관련 문서: [research-landscape.md](../../research-landscape.md) (관련 연구·차별화), [study-guide.md](../../study-guide.md) (선행 학습), [roadmap.md](../../roadmap.md) (주차 계획)
 
 ---
@@ -45,6 +45,8 @@
 - **Memory step**: memory store 항목을 읽거나 쓴다.
 - **Assemble step**: 여러 block/artifact를 결정적으로 합쳐 prompt나 중간 결과를 만든다 (LLM·tool 호출 없음).
 
+> **v1 주의(구현 제약)**: tool의 env 부작용(파일/DB 쓰기)은 v1에서 **기록하지 않는다**. step 안에서 env를 바꾸면 runtime이 실행 전후 env 버전을 비교해 `EnvMutatedInStep`을 던진다. orchestration 코드(step 밖)도 env를 바꾸면 안 된다 — 이는 규약이고 v1은 강제하지 않는다(`VersionedEnv.set`은 공개 API). env write의 기록·검증은 후속 계획이다.
+
 **편집(edit)** 은 source 노드의 변경이다: 사용자 조건 block, tool의 외부 결과(환경 변경·실패로 모사), memory 항목, system prompt/tool schema.
 
 **목표**: 편집 후 full rerun이 만들었을 trajectory와 같은 결과를, 가능한 한 적은 step만 실행해서 만든다.
@@ -77,14 +79,14 @@
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │ agent programs (workloads/)  : trip_planner, research_pipeline… │
-│   step 함수 = @step(reads=[...], writes=[...])                    │
+│   step 함수 = @step(kind=...)  (reads/writes는 실행 중 자동 기록)  │
 └───────────────┬──────────────────────────────────────────────────┘
                 │ step 호출
 ┌───────────────▼──────────────────────────────────────────────────┐
 │ runtime core (agent_urp/core)                                    │
-│  Scheduler ── Invalidator(dirty propagation, early cutoff)       │
+│  Runtime(program 재실행) ── policies.choose_reuse + backdating    │
 │     │              │                                             │
-│  ContextAssembler  │   Memo(constructive trace: input-hash→out)  │
+│  ContextAssembler  │   Memo(constructive trace: key_static→기록) │
 │     │              ▼                                             │
 │  TraceStore (SQLite): Artifact / Block / StepRecord / Edit       │
 │  DepGraph (NetworkX, TraceStore에서 재구성)                      │
@@ -108,15 +110,15 @@
 
 | 컴포넌트 | 역할 | 인터페이스 | 의존 |
 |---|---|---|---|
-| `TraceStore` | 모든 artifact·block 버전·step 기록·편집을 append-only로 저장 | `put_artifact`, `record_step`, `get_run`, `new_version` | SQLite |
-| `DepGraph` | run의 의존성 그래프 (block/artifact → step → artifact) | `dirty_from(changed_ids)`, `topo_order` | NetworkX, TraceStore |
-| `ContextAssembler` | step이 선언한 block들로 prompt 조립, **layout 정책** 적용 (stable-prefix 순서) | `assemble(step, block_versions) -> Prompt` | TraceStore |
-| `Memo` | constructive trace: `(step_kind, input_hash) → output artifact` | `lookup`, `store` | TraceStore |
+| `TraceStore` | 모든 artifact·block 버전·env snapshot·run·편집·step 기록을 append-only로 저장, memo 색인 | `put/get_artifact`, `put/get_block`, `put/get_env_snapshot`, `put/get_run`, `put/get_edit`, `record_step`/`get_steps`, `memo_put(rec)`/`memo_candidates(key_static)` (`new_version` 없음) | SQLite |
+| `DepGraph` | run의 의존성 그래프 (block/env/artifact → step → artifact/block, orchestration_reads 포함) | `readers_of(name)`, `first_dirty_seq(names)`, `dirty_from(names)`, `to_dot()` (`topo_order` 없음) | NetworkX, StepRecord |
+| `ContextAssembler` | step이 넘긴 block 이름 목록으로 prompt 조립, **layout 정책** 적용 (`naive` / `stable_prefix`: durability 순 안정 정렬) | `assemble(blocks, extra) -> Prompt` | models(Block) |
+| Memo | constructive trace — 별도 클래스 없음: `key_static`으로 색인한 StepRecord 후보(최신순) 중 reads가 검증되는(DEP) / `state_hash`가 같은(MEMO) 기록을 재사용. 검색 범위는 현재 run + 조상 run | `TraceStore.memo_put`/`memo_candidates(key_static)` + runtime의 lineage 필터 | TraceStore |
 | `policies` | 정책(FULL/SUFFIX/MEMO/DEP)별로 "이 step 호출을 어떤 기록으로 재사용할 수 있나" 판정 | `choose_reuse(policy, key_static, old, first_dirty_seq, memo_candidates, verify, state_hash) -> StepRecord \| None` | DepGraph, TraceStore |
-| `Equivalence` | pluggable 동등성 oracle: exact / normalized / toolcall-canonical / embedding / llm-judge | `equivalent(a, b, level) -> bool` | 선택적으로 LLM backend |
-| `Runtime` | 워크로드 프로그램을 실행·재실행하며 step 호출마다 REUSE/REBUILD/RERUN/LIVE 결정, 동등성 backdating, 기록 | `run(program, blocks, envs, policy)`, `replay(program, parent_run_id, edit, policy)` | 위 전부 |
-| `LLMBackend` | 통일된 호출 + usage(입력/출력/cached token) 기록 | `complete(prompt, params) -> (text, usage)` | provider SDK |
-| `CostModel` | 예상 비용(uncached prefill, decode) 계산, probe 여부·layout 선택에 사용 | `estimate(prompt, cache_state)` | tokenizer, 실측 usage |
+| `Equivalence` | pluggable 동등성 oracle: exact / normalized / toolcall-canonical / embedding / llm-judge (v1은 L0·L1만) | `equivalent(a, b, level) -> bool` | 선택적으로 LLM backend |
+| `Runtime` | 워크로드 프로그램을 실행·재실행하며 step 호출마다 REUSE/REBUILD/RERUN/LIVE 결정, 동등성 backdating, 기록 | `run(program, blocks, envs, policy, parent_run=None, edit=None)`, `replay(program, parent_run_id, edit, policy)` (부모 run과 layout이 다르면 `ValueError`) | 위 전부 |
+| `LLMBackend` | 통일된 호출 + usage(입력/출력/cached token) 기록 | `complete(prompt, params) -> LLMResponse{text, usage}` | provider SDK |
+| `CostModel` | 예상 비용(uncached prefill, decode) 계산, probe 여부·layout 선택에 사용 (v1 미구현, 후속 `cost.py`) | `estimate(prompt, cache_state)` | tokenizer, 실측 usage |
 
 ---
 
@@ -125,25 +127,32 @@
 모두 content-addressed (blake2b). 저장은 SQLite 테이블 + JSONL export.
 
 ```
-Artifact   { id=hash(content), kind: text|toolcall|toolresult|json, content, created_by: step_id|null }
+Artifact   { id=hash(kind, content), kind: text|toolcall|toolresult|json (v1: 만든 step의 kind), content, created_by: step_id|null }
 Block      { name (system, tools, goal, constraint.budget, memory.units, history.3, doc.2 …),
              version=hash(content), content, kind: static|user|memory|derived, derived_from: [artifact_id],
              durability: high|medium|low }   # Salsa식 등급: system/tools=high, 문서·memory=medium, 방금 편집된 조건=low
-StepRecord { id, run_id, seq, kind: llm|tool|memory|assemble,
+StepRecord { id, run_id, seq, name, occurrence(같은 name의 몇 번째 호출), kind: llm|tool|memory|assemble,
+             key_static = hash(name, kind, code_version, {artifact 인자 이름: id}, 일반 인자값),   # §6.2
              reads: [(block_name, version) | artifact_id | env_id@version],
-             params: {model, temperature, seed, tool_name…, sampling_intent: stable|fresh},
-                     # fresh = self-consistency처럼 일부러 독립 샘플을 원하는 호출 → Memo 재사용 금지
-             code_version: hash(prompt 템플릿 소스 | tool 구현 버전),   # Dagster의 code_version
-             input_hash = hash(code_version, reads, params),           # Dagster의 data_version, DSPy식 canonical JSON→SHA/blake2b
+             orchestration_reads: [직전 step 이후 program(step 밖)이 읽은 block/env 버전],
+             params: {args, state_hash, llm: [{blocks, params(model, temperature, seed…)}]},
+             sampling_intent: stable|fresh,
+                     # fresh = self-consistency처럼 일부러 독립 샘플을 원하는 호출 → MEMO/DEP 재사용 금지, memo에 넣지 않음
+             code_version: hash(step 함수 자신의 소스),   # Dagster의 code_version (helper 함수는 포함 안 됨, §6.1)
+             input_hash = hash(key_static, reads),        # Dagster의 data_version; 인자는 key_static(args)에, llm params는 params에
              writes: [artifact_id | (block_name, new_version)],
              usage: {input_tokens, output_tokens, cached_tokens, latency_ms, ttft_ms?},
-             decision: REUSE|REBUILD|RERUN|LIVE, equivalent_to: step_id|null }
-Edit       { id, run_id, kind: constraint|tool_result|memory|system, target, old_version, new_version }
-Run        { id, parent_run_id, edit_id, policy: FULL|SUFFIX|MEMO|DEP, layout: naive|stable_prefix, metrics }
+             decision: REUSE|REBUILD|RERUN|LIVE, equivalent_to: step_id|null, reused_from: step_id|null }
+Edit       { id, kind: constraint|tool_result|memory|system, target, target_kind: block|env, content,
+             old_version, new_version }
+Run        { id, parent_run_id, edit_id, policy: FULL|SUFFIX|MEMO|DEP, layout: naive|stable_prefix, level: 0|1,
+             initial_blocks: {name: version}, initial_envs: {name: version},
+             block_meta: {name: {kind, durability}}, metrics }
 ```
 
 - **verifying trace** = StepRecord의 `reads` 버전 목록. "모든 read 버전이 현재와 같으면 up-to-date".
-- **constructive trace** = `Memo[(kind, input_hash)] → writes`. 편집을 되돌리면(undo) 즉시 복원되고, 구조가 갈라진 뒤에도 같은 tool 호출을 재사용한다.
+- **constructive trace** = `Memo[key_static] → StepRecord 후보`(최신순). DEP는 후보의 reads가 현재 버전으로 검증되면, MEMO는 `state_hash`가 같으면 재사용한다. 검색 범위는 현재 run + 조상 run이다(형제 replay끼리는 공유하지 않는다). 편집을 되돌리면(undo) 즉시 복원되고, 구조가 갈라진 뒤에도 같은 tool 호출을 재사용한다.
+- **Run의 layout·level·block_meta**: `layout`은 run을 만든 assembler의 layout, `level`은 runtime의 동등성 수준이다. `replay`(와 `run(parent_run=…)`)를 부모 run과 layout이 다른 runtime에서 부르면 아무것도 저장하기 전에 `ValueError`다(prompt 바이트가 달라져 정책 비교가 무의미해진다). 초기 block의 kind/durability는 run마다 `block_meta`에 저장해 replay 때 그대로 복원한다 — store의 block 행은 (name, version)마다 처음 들어온 메타데이터만 남기 때문이다. 같은 이유로 재사용된 step의 block write도 `set_block`과 같은 규칙(현재 run의 같은 이름 block의 kind/durability, 없으면 derived/medium)으로 다시 만든다.
 - 외부 상태(mock DB, 검색 인덱스, 파일)는 `env_id@version` 노드다. tool 결과 변경 시나리오는 env 버전을 올려서 모사한다.
 
 ---
@@ -152,18 +161,26 @@ Run        { id, parent_run_id, edit_id, policy: FULL|SUFFIX|MEMO|DEP, layout: n
 
 ### 6.1 기록 (첫 실행)
 
-워크로드는 `program(ctx)` 형태의 **결정적 Python 함수**(orchestration)이고, 비용이 드는 일은 전부 `@step(kind=...)`로 감싼 함수 호출로만 일어난다. step 함수는 `ctx.block(name)` / `ctx.env(name)` / `ctx.llm(blocks=[...], extra=...)` 로만 상태에 접근하므로 **read set이 실행 중 자동으로 발견·기록**된다(선언 누락 위험 없음; 같은 step이 방금 쓴 block을 다시 읽는 것은 read로 치지 않는다). LLM step의 prompt는 `ContextAssembler`가 block 이름 목록으로 조립한다(직접 문자열 결합 금지). 인자로 받은 artifact는 정적 read이고, 반환값은 content-addressed artifact가 된다. 실행 후 StepRecord를 남기고 Memo(constructive trace)에 넣는다.
+워크로드는 `program(ctx)` 형태의 **결정적 Python 함수**(orchestration)이고, 비용이 드는 일은 전부 `@step(kind=...)`로 감싼 함수 호출로만 일어난다. step 함수는 `ctx.block(name)` / `ctx.env(name)` / `ctx.llm(blocks=[...], extra=...)` 로만 상태에 접근하므로 **read set이 실행 중 자동으로 발견·기록**된다(선언 누락 위험 없음; 같은 step이 방금 쓴 block을 다시 읽는 것은 read로 치지 않는다). LLM step의 prompt는 `ContextAssembler`가 block 이름 목록으로 조립한다(직접 문자열 결합 금지). 인자로 받은 artifact는 정적 read이고, 반환값은 content-addressed artifact가 된다. 실행 후 StepRecord를 남기고 Memo(constructive trace)에 넣는다(`sampling_intent=fresh` step의 기록은 넣지 않는다).
+
+**값 정규화**: step 반환값, `set_block` 내용, run 입력(초기 block 내용·env 상태)은 모두 JSON canonical 왕복(`json.loads(canonical_json(x))`: tuple→list, pydantic 모델→dict, dict 키는 `str`만 허용)을 거친다 — 실행 경로와 재사용 경로가 항상 같은 값을 돌려주게 하기 위함이다.
+
+**step 순수성 규약**: step의 결과는 **kwargs와 `ctx.block`/`ctx.env`/`ctx.llm` 읽기에만** 의존해야 한다 — program 지역 변수에 대한 closure, 전역 변수, 파일, 시계 금지. runtime은 step 함수의 closure 중 함수·클래스가 아닌 값(= program 지역 값)을 발견하면 `ClosureNotAllowed`로 거부한다(전역·파일·시계는 규약으로만 금지). `code_version`은 step 함수 **자신의 소스만** 해시하므로 step이 부르는 helper 함수를 고쳐도 기존 기록이 무효화되지 않는다 — helper를 바꾸면 새 base run부터 다시 기록한다.
 
 ### 6.2 편집 → 재실행: 프로그램 재실행 + trace 검증 (Temporal식 replay)
 
 편집 후 runtime은 (1) 원 run의 초기 상태(block·env 버전)를 복원하고 편집을 적용한 뒤 (2) **프로그램을 처음부터 다시 실행**한다. orchestration은 싸고, 각 step 호출에서만 아래를 판정한다:
 
 ```
-key_static = hash(step name, code_version, {artifact 인자 이름: id}, 일반 인자값)   # 인자 이름 포함: 인자 교환을 구분
+key_static = hash(step name, kind, code_version, {artifact 인자 이름: id}, 일반 인자값)   # 인자 이름 포함: 인자 교환을 구분
 old        = 원 run에서 같은 (name, 등장 순서)의 기록   # 없으면 제어 흐름이 갈라진 것 → LIVE
 DEP:
+  0. sampling_intent=fresh → 재사용하지 않고 바로 3 (MEMO도 동일)
   1. verifying trace : old.key_static == key_static 이고 old.reads의 block/env 버전이 모두 현재와 같으면
                        → REUSE (함수 실행 없이 기록된 writes 적용)
+     orchestration_reads는 검증하지 않는다: program이 읽은 값은 kwargs로만 step에 들어가고 kwargs는 key_static에
+     들어 있으므로 값이 바뀌면 key가 달라진다(분기가 바뀌면 (name, 순서)가 달라진다). 값이 closure로 새는 경로는
+     §6.1의 closure 금지가 막는다.
   2. constructive trace(Memo): 같은 key_static의 다른 기록 중 reads가 검증되는 것이 있으면 → REUSE
      (검색 범위는 현재 run의 조상 run들 — 같은 편집의 형제 replay끼리는 서로 재사용하지 않아 정책별 결과가 실행 순서와 무관)
   3. 실행: assemble → REBUILD, llm/tool → RERUN (old 없으면 LIVE)
@@ -171,8 +188,11 @@ DEP:
      → 하위 step은 같은 artifact id를 인자로 받으므로 1에서 자연히 REUSE된다
 SUFFIX: 원 run에서 편집 대상 block/env를 처음 읽은 step의 seq 이전이면 위치(name, 순서)만으로 REUSE, 이후 전부 실행
         (LangGraph time-travel의 선형 판; 대상을 아무도 안 읽었으면 전부 REUSE)
+        "읽음"에는 step의 reads와 orchestration_reads(그 step 직전에 program이 읽은 것)가 모두 들어간다.
+        편집 대상 = edit.target ∪ 초기 버전이 부모와 다른 block/env 이름(edit 없이 parent_run만 줘도 동작한다).
+        sampling_intent=fresh step도 위치로 REUSE한다(checkpoint-fork 의미론: fork 이전 샘플은 그대로 — LangGraph와 동일).
 MEMO  : LangGraph CachePolicy 모사 — key = hash(name, code_version, 인자, 전체 현재 상태(모든 block·env 버전))가
-        정확히 같은 기록이 있을 때만 REUSE
+        정확히 같은 기록이 있을 때만 REUSE (fresh step은 재사용하지 않는다)
 FULL  : 항상 실행
 ```
 
@@ -246,7 +266,7 @@ cost(llm step) ≈ c_pre·(uncached prefill tokens) + c_hit·(cached tokens) + c
 
 - **FULL**: 전부 재실행, memo 없음.
 - **SUFFIX**: 편집 영향 지점 이후 전부 재실행 (자체 구현). **SUFFIX-LG**: 같은 step 함수를 LangGraph `StateGraph`로 감싸 time-travel fork로 돌린 독립 구현 — 두 결과가 같아야 한다(교차 검증).
-- **MEMO-only**: 그래프 추적 없이 `(kind, input_hash)`가 같으면 재사용 (LangGraph `CachePolicy`/LangChain LLM cache 의미론). DEP와의 차이가 "의존성 그래프 + early cutoff"의 순수 기여다.
+- **MEMO-only**: 그래프 추적 없이 `key_static` + **전체 상태 키**(`state_hash` = 모든 block·env 버전)가 같으면 재사용 — LangGraph `CachePolicy` 의미론(노드 입력 = 전체 state). DEP와의 차이가 "의존성 그래프 + early cutoff"의 순수 기여다. prompt 바이트를 키로 하는 LLM-cache 베이스라인(LangChain LLM cache·DSPy식, LLM 호출만 캐시)은 후속으로 추가한다 — 키가 달라 v1 MEMO와는 별개의 베이스라인이다.
 - **DEP**(ours) 및 +cache, +cache+layout 변형.
 
 ---

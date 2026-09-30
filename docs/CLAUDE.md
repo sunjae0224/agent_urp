@@ -9,7 +9,7 @@
 | 문서 | 내용 |
 |---|---|
 | `docs/superpowers/specs/2026-09-30-agent-urp-design.md` | **설계 스펙**(단일 진실 공급원) — 목표·문제 정의·접근법 비교·아키텍처·데이터 모델(§5)·실행 모델(§6, DEP/SUFFIX/MEMO/FULL·동등성 L0~L4)·context/cache 레이어(§7)·워크로드·시나리오·지표(§8)·테스트 전략·범위 밖·리스크·열린 질문. |
-| `docs/superpowers/plans/2026-09-30-skeleton-v1.md` | v1 뼈대 구현 계획 — Task 1~8 각각의 파일·인터페이스·TDD 단계, Global Constraints, Review Focus. |
+| `docs/superpowers/plans/2026-09-30-skeleton-v1.md` | v1 뼈대 구현 계획 — Task 1~8 각각의 파일·인터페이스·TDD 단계, Global Constraints, Review Focus. 맨 위 "실행 후 메모": 실행 중 판정(ledger)이 계획의 참조 코드보다 우선한다. |
 | `docs/research-landscape.md` | 관련 연구 5개 분야 지도, 계획서 인용 검증, 최근접 선행 연구 2편 대조, 우리 기여·위협과 대응, 필독 논문, 프레임워크·벤치마크 판정. |
 | `docs/study-guide.md` | 에이전트 경험 없는 팀원용 선행 학습 — 주차별 학습, 세미나 순서, 도구·개념 체크리스트. |
 | `docs/roadmap.md` | 12/18까지 주차 계획, 팀 역할, GPU-free→GPU 확장 경로, 데모 체크포인트. |
@@ -20,4 +20,6 @@
 
 ## 하위 폴더
 
-- docs/superpowers/ — SDD 스펙·계획 원본(위 표의 두 파일). 별도 CLAUDE.md 없음(문서만 있고 코드 없음).
+코드가 없는 하위 폴더에는 CLAUDE.md를 두지 않는다 — 그 안의 문서는 위 "문서 지도" 표에 있다.
+
+- docs/superpowers/
