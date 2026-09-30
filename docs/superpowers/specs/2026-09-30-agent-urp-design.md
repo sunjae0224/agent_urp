@@ -152,19 +152,20 @@ Run        { id, parent_run_id, edit_id, policy: FULL|SUFFIX|MEMO|DEP, layout: n
 
 ### 6.1 기록 (첫 실행)
 
-워크로드는 `program(ctx)` 형태의 **결정적 Python 함수**(orchestration)이고, 비용이 드는 일은 전부 `@step(kind=...)`로 감싼 함수 호출로만 일어난다. step 함수는 `ctx.block(name)` / `ctx.env(name)` / `ctx.llm(blocks=[...], extra=...)` 로만 상태에 접근하므로 **read set이 실행 중 자동으로 발견·기록**된다(선언 누락 위험 없음). LLM step의 prompt는 `ContextAssembler`가 block 이름 목록으로 조립한다(직접 문자열 결합 금지). 인자로 받은 artifact는 정적 read이고, 반환값은 content-addressed artifact가 된다. 실행 후 StepRecord를 남기고 Memo(constructive trace)에 넣는다.
+워크로드는 `program(ctx)` 형태의 **결정적 Python 함수**(orchestration)이고, 비용이 드는 일은 전부 `@step(kind=...)`로 감싼 함수 호출로만 일어난다. step 함수는 `ctx.block(name)` / `ctx.env(name)` / `ctx.llm(blocks=[...], extra=...)` 로만 상태에 접근하므로 **read set이 실행 중 자동으로 발견·기록**된다(선언 누락 위험 없음; 같은 step이 방금 쓴 block을 다시 읽는 것은 read로 치지 않는다). LLM step의 prompt는 `ContextAssembler`가 block 이름 목록으로 조립한다(직접 문자열 결합 금지). 인자로 받은 artifact는 정적 read이고, 반환값은 content-addressed artifact가 된다. 실행 후 StepRecord를 남기고 Memo(constructive trace)에 넣는다.
 
 ### 6.2 편집 → 재실행: 프로그램 재실행 + trace 검증 (Temporal식 replay)
 
 편집 후 runtime은 (1) 원 run의 초기 상태(block·env 버전)를 복원하고 편집을 적용한 뒤 (2) **프로그램을 처음부터 다시 실행**한다. orchestration은 싸고, 각 step 호출에서만 아래를 판정한다:
 
 ```
-key_static = hash(step name, code_version, artifact 인자 id들, 일반 인자값)
+key_static = hash(step name, code_version, {artifact 인자 이름: id}, 일반 인자값)   # 인자 이름 포함: 인자 교환을 구분
 old        = 원 run에서 같은 (name, 등장 순서)의 기록   # 없으면 제어 흐름이 갈라진 것 → LIVE
 DEP:
   1. verifying trace : old.key_static == key_static 이고 old.reads의 block/env 버전이 모두 현재와 같으면
                        → REUSE (함수 실행 없이 기록된 writes 적용)
   2. constructive trace(Memo): 같은 key_static의 다른 기록 중 reads가 검증되는 것이 있으면 → REUSE
+     (검색 범위는 현재 run의 조상 run들 — 같은 편집의 형제 replay끼리는 서로 재사용하지 않아 정책별 결과가 실행 순서와 무관)
   3. 실행: assemble → REBUILD, llm/tool → RERUN (old 없으면 LIVE)
   4. backdating(early cutoff): old가 있고 새 출력이 old 출력과 동등(6.3)하면 old artifact를 반환·기록(equivalent_to)
      → 하위 step은 같은 artifact id를 인자로 받으므로 1에서 자연히 REUSE된다
